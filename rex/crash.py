@@ -16,7 +16,7 @@ import archr
 from tracer import TracerPoV, TinyCore
 
 from .exploit import CannotExploit, CannotExplore, ExploitFactory, CGCExploitFactory
-from .vulnerability import Vulnerability
+from .vulnerability import Vulnerability, check_fsb, Exploitables, Explorables, Leakables
 from .enums import CrashInputType
 from .preconstrained_file_stream import SimPreconstrainedFileStream
 
@@ -68,27 +68,34 @@ class Crash:
         :param angrop_object:       An angrop object, should only be set by exploration methods.
         """
 
+        # rex internal data
+        self.crash = crash
+        self.crash_types = [ ]  # crash type
+
+        # rex configuration, something won't change during the life cycle
+        self.input_type = input_type
+        self.use_crash_input = use_crash_input
         self.target = target # type: archr.targets.Target
+
+        # ROP related attributes
+        self._use_rop = use_rop
+        self._rop_fast_mode = fast_mode
+        self._rop_cache_tuple = rop_cache_tuple
+        self.rop = None
+
+        # unclassified attributes
         self.constrained_addrs = [ ] if constrained_addrs is None else constrained_addrs
         self.hooks = {} if hooks is None else hooks
-        self.use_crash_input = use_crash_input
-        self.input_type = input_type
         self.target_port = port
-        self.crash = crash
         self.tracer_bow = tracer_bow if tracer_bow is not None else archr.arsenal.QEMUTracerBow(self.target)
 
         self.explore_steps = explore_steps
         if self.explore_steps > 10:
             raise CannotExploit("Too many steps taken during crash exploration")
 
-        self._use_rop = use_rop
-        self._rop_fast_mode = fast_mode
-        self._rop_cache_tuple = rop_cache_tuple
-
         self.angr_project_bow = None
         self.project = None
         self.binary = None
-        self.rop = None
         self.initial_state = None
         self.state = None
         self.prev = None
@@ -98,7 +105,6 @@ class Crash:
 
         self.symbolic_mem = None
         self.flag_mem = None
-        self.crash_types = [ ]  # crash type
         self.violating_action = None  # action (in case of a bad write or read) which caused the crash
 
         # Initialize
@@ -129,10 +135,7 @@ class Crash:
         :return: True if the crash's type is generally considered exploitable, False otherwise
         """
 
-        exploitables = [Vulnerability.IP_OVERWRITE, Vulnerability.PARTIAL_IP_OVERWRITE, Vulnerability.BP_OVERWRITE,
-                Vulnerability.PARTIAL_BP_OVERWRITE, Vulnerability.WRITE_WHAT_WHERE, Vulnerability.WRITE_X_WHERE]
-
-        return self.one_of(exploitables)
+        return self.one_of(Exploitables)
 
     def explorable(self):
         """
@@ -141,10 +144,7 @@ class Crash:
         :return: True if the crash's type lends itself to exploring, only 'arbitrary-read' for now
         """
 
-        # TODO add arbitrary receive into this list
-        explorables = [Vulnerability.ARBITRARY_READ, Vulnerability.WRITE_WHAT_WHERE, Vulnerability.WRITE_X_WHERE]
-
-        return self.one_of(explorables)
+        return self.one_of(Explorables)
 
     def leakable(self):
         """
@@ -153,7 +153,7 @@ class Crash:
         :return: True if the 'point-to-flag' technique can be applied to this crash
         """
 
-        return self.one_of([Vulnerability.ARBITRARY_READ, Vulnerability.ARBITRARY_TRANSMIT])
+        return self.one_of(Leakables)
 
     def _prepare_exploit_factory(self, blacklist_symbolic_explore=True, **kwargs):
         # crash should have been classified at this point
@@ -392,20 +392,20 @@ class Crash:
         cp.input_type = self.input_type
         cp.project = self.project
         cp.aslr = self.aslr
-        cp.prev = self.prev.copy()
-        cp.state = self.state.copy()
+        cp.prev = self.prev.copy() if self.prev else None
+        cp.state = self.state.copy() if self.state else None
         cp.initial_state = self.initial_state
         cp.rop = self.rop
         cp.added_actions = list(self.added_actions)
-        cp.symbolic_mem = self.symbolic_mem.copy()
-        cp.flag_mem = self.flag_mem.copy()
+        cp.symbolic_mem = self.symbolic_mem.copy() if self.symbolic_mem else None
+        cp.flag_mem = self.flag_mem.copy() if self.flag_mem else None
         cp.crash_types = self.crash_types
         cp._t = self._t
         cp.violating_action = self.violating_action
         cp.use_crash_input = self.use_crash_input
         cp.explore_steps = self.explore_steps
         cp.constrained_addrs = list(self.constrained_addrs)
-        cp.core_registers = self.core_registers.copy() if self.core_registers is not None else None
+        cp.core_registers = self.core_registers.copy() if self.core_registers else None
 
         return cp
 
@@ -440,7 +440,7 @@ class Crash:
         with open(path, "rb") as f:
             try:
                 s = pickle.load(f)
-            except EOFError as ex:
+            except EOFError:
                 raise EOFError("Fail to restore from checkpoint %s", path)
 
         keys = {'initial_state',
@@ -510,6 +510,8 @@ class Crash:
         self.angr_project_bow = archr.arsenal.angrProjectBow(self.target, dsb)
         self.project = self.angr_project_bow.fire()
         self.binary = self.target.resolve_local_path(self.target.target_path)
+        if self.project.loader.main_object.os == 'cgc':
+            self.project.simos.syscall_library.update(angr.SIM_LIBRARIES['cgcabi_tracer'])
 
         # Add custom hooks
         for addr, proc in self.hooks.items():
@@ -530,9 +532,6 @@ class Crash:
                                                 rop_cache_path=rop_cache_path)
         else:
             self.rop = None
-
-        if self.project.loader.main_object.os == 'cgc':
-            self.project.simos.syscall_library.update(angr.SIM_LIBRARIES['cgcabi_tracer'])
 
         # Load cached/intermediate states
         self.core_registers = None
@@ -616,6 +615,9 @@ class Crash:
             if r.core_path and os.path.isfile(r.core_path):
                 tiny_core = TinyCore(r.core_path)
                 self.core_registers = tiny_core.registers
+
+                # when we are done with the core file, we need to remove it
+                os.unlink(r.core_path)
             else:
                 l.error("Cannot find core file (path: %s). Maybe the target process did not crash?",
                         r.core_path)
@@ -631,7 +633,7 @@ class Crash:
         )
 
         # trace symbolically!
-        self._t = r.tracer_technique(keep_predecessors=2, copy_states=False, mode=TracingMode.Strict)
+        self._t = r.tracer_technique(keep_predecessors=2, copy_states=False, mode=TracingMode.CatchDesync)
         simgr.use_technique(self._t)
         simgr.use_technique(angr.exploration_techniques.Oppologist())
         if self.is_cgc:
@@ -642,11 +644,16 @@ class Crash:
 
         # tracing completed
         # if there was no crash we'll have to use the previous path's state
-        if 'crashed' in simgr.stashes:
+        if 'crashed' in simgr.stashes and simgr.crashed:
             # the state at crash time
             self.state = simgr.crashed[0]
             # a path leading up to the crashing basic block
             self.prev = self._t.predecessors[-1]
+        elif 'desync' in simgr.stashes and simgr.desync:
+            self.state = simgr.desync[0]
+            self.prev = None
+            l.debug("Done tracing input.")
+            return
         else:
             self.state = simgr.traced[0]
             self.prev = self.state
@@ -894,6 +901,12 @@ class Crash:
         ip = self.state.regs.ip
         bp = self.state.regs.bp
 
+        # check whether there is a format string bug
+        if self.project.is_hooked(self.state.addr):
+            if check_fsb(self.state):
+                l.debug("detected format string bug vulnerability")
+                self.crash_types.append(Vulnerability.FORMAT_STRING_BUG)
+
         # any arbitrary receives or transmits
         # TODO: receives
         zp = self.state.get_plugin('zen_plugin') if self.is_cgc else None
@@ -930,11 +943,8 @@ class Crash:
         symbolic_actions = [ ]
         if self._t is not None and self._t.last_state is not None:
             recent_actions = reversed(self._t.last_state.history.recent_actions)
-            state = self._t.last_state
-            # TODO: this is a dead assignment! what was this supposed to be?
         else:
             recent_actions = reversed(self.state.history.actions)
-            state = self.state
         for a in recent_actions:
             if a.type == 'mem':
                 if self.state.solver.symbolic(a.addr.ast):
